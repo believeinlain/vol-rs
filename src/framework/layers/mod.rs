@@ -11,6 +11,7 @@
 pub mod physical;
 pub mod segmented;
 pub mod intel;
+pub mod arm;
 pub mod elf;
 pub mod lime;
 pub mod crash;

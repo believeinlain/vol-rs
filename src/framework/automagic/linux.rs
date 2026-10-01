@@ -16,7 +16,9 @@ use crate::framework::automagic::symbol_finder::{first_known_banner, BannerIndex
 use crate::framework::layers::scanners::{scan_layer_until, RegExScanner};
 use crate::framework::automagic::DetectedOs;
 use crate::framework::context::{Context, Module};
+use crate::framework::layers::arm::ArmLayer;
 use crate::framework::layers::intel::{IntelLayer, LINUX_INTEL, LINUX_INTEL_32E};
+use crate::framework::layers::DataLayer;
 use crate::framework::symbols::intermed::{create_table, SymbolFinder};
 
 /// The banner prefix every Linux kernel writes.
@@ -143,18 +145,15 @@ pub fn detect(
         };
         let dtb = unshifted.wrapping_add(shifts.physical);
 
-        let config = if pointer_size == 8 {
-            LINUX_INTEL_32E
-        } else {
-            LINUX_INTEL
-        };
         let layer_name = context.layers.free_name("layer_name");
-        context.layers.add(Arc::new(IntelLayer::new(
-            &layer_name,
-            physical_layer,
-            dtb,
-            config,
-        )));
+        let (layer, kind): (Arc<dyn DataLayer>, &str) = if is_arm32(context, &table_name, pointer_size) {
+            (Arc::new(ArmLayer::new(&layer_name, physical_layer, dtb)), "ARMv7")
+        } else if pointer_size == 8 {
+            (Arc::new(IntelLayer::new(&layer_name, physical_layer, dtb, LINUX_INTEL_32E)), "Intel32e")
+        } else {
+            (Arc::new(IntelLayer::new(&layer_name, physical_layer, dtb, LINUX_INTEL)), "Intel")
+        };
+        context.layers.add(layer);
 
         // Symbol addresses are absolute but need the virtual shift applied, so
         // the module carries it as its load offset.
@@ -183,7 +182,7 @@ pub fn detect(
         );
 
         log::info!(
-            "Linux kernel layer '{layer_name}' built with DTB {dtb:#x} from {dtb_symbol} \
+            "Linux kernel layer '{layer_name}' ({kind}) built with DTB {dtb:#x} from {dtb_symbol} \
              (physical shift {:#x}, virtual shift {:#x})",
             shifts.physical,
             shifts.virtual_shift
@@ -232,6 +231,26 @@ pub fn detect(
             .join("; ")
     );
     Ok(None)
+}
+
+/// Whether the kernel the symbol table describes is 32-bit ARM.
+///
+/// An ISF does not name its architecture, but the kernel's own types and symbols
+/// do: `pt_regs` on ARM is the single `uregs` array, and `__cpu_architecture` is
+/// the probed CPU architecture that only arch/arm has. Either is conclusive; a
+/// 32-bit x86 kernel has neither.
+fn is_arm32(context: &Arc<Context>, table_name: &str, pointer_size: usize) -> bool {
+    if pointer_size != 4 {
+        return false;
+    }
+    let qualified = |name: &str| crate::framework::symbols::join_name(table_name, name);
+    let has_uregs = context
+        .symbol_space
+        .get_type(&qualified("pt_regs"))
+        .ok()
+        .and_then(|pt_regs| context.symbol_space.find_member(&pt_regs, "uregs").ok().flatten())
+        .is_some();
+    has_uregs || context.symbol_space.has_symbol(&qualified("__cpu_architecture"))
 }
 
 /// How far the running kernel is shifted from the addresses in its symbol file.
@@ -436,7 +455,9 @@ pub fn virtual_to_physical(address: u64, pointer_size: usize) -> Option<u64> {
             None
         }
     } else {
-        // 32-bit kernels map physical memory at 0xC0000000.
+        // 32-bit kernels (x86 and ARM with the default 3G/1G split) map physical
+        // memory at 0xC0000000. The physical shift measured from the idle task
+        // then carries the platform's RAM base (0x40000000 on QEMU `virt`).
         const PAGE_OFFSET_32: u64 = 0xC000_0000;
         (address >= PAGE_OFFSET_32).then(|| address - PAGE_OFFSET_32)
     }

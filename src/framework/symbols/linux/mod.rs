@@ -191,6 +191,7 @@ impl Task {
     /// tables, rooted at the `pgd` its memory descriptor records. Kernel threads
     /// have no such descriptor and so return `None`.
     pub fn process_layer(&self) -> Result<Option<String>> {
+        use crate::framework::layers::arm::ArmLayer;
         use crate::framework::layers::intel::IntelLayer;
 
         let Some(mm) = self.mm()? else {
@@ -200,29 +201,41 @@ impl Task {
 
         let context = self.object.context();
         let parent = context.layers.get(self.object.layer_name())?;
-        let Some(intel) = parent.as_any().downcast_ref::<IntelLayer>() else {
-            return Ok(None);
-        };
-
-        // `pgd` is a kernel virtual address. The new layer needs the physical
-        // one to use as the root of its own page table walk.
-        let Ok((dtb, _)) = intel.translate_single(&context.layers, pgd) else {
-            return Ok(None);
-        };
-        if dtb == 0 {
-            return Ok(None);
-        }
-
         let name = context
             .layers
             .free_name(&format!("{}_Process", self.object.layer_name()));
-        context.layers.add(Arc::new(IntelLayer::new(
-            name.clone(),
-            intel.base_layer_name(),
-            dtb,
-            intel.config().clone(),
-        )));
-        Ok(Some(name))
+
+        // `pgd` is a kernel virtual address. The new layer needs the physical
+        // one to use as the root of its own page table walk, and is of the same
+        // kind as the kernel's layer.
+        if let Some(intel) = parent.as_any().downcast_ref::<IntelLayer>() {
+            let Ok((dtb, _)) = intel.translate_single(&context.layers, pgd) else {
+                return Ok(None);
+            };
+            if dtb == 0 {
+                return Ok(None);
+            }
+            context.layers.add(Arc::new(IntelLayer::new(
+                name.clone(),
+                intel.base_layer_name(),
+                dtb,
+                intel.config().clone(),
+            )));
+            return Ok(Some(name));
+        }
+        if let Some(arm) = parent.as_any().downcast_ref::<ArmLayer>() {
+            let Ok((dtb, _)) = arm.translate_single(&context.layers, pgd) else {
+                return Ok(None);
+            };
+            if dtb == 0 {
+                return Ok(None);
+            }
+            context
+                .layers
+                .add(Arc::new(ArmLayer::new(name.clone(), arm.base_layer_name(), dtb)));
+            return Ok(Some(name));
+        }
+        Ok(None)
     }
 
     /// Whether the task looks like a real task rather than a smeared one.
